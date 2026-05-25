@@ -10,24 +10,30 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import io
 import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from dataclasses import asdict, dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable, Optional
 
-from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
+from flask import Flask, Response, abort, g, jsonify, request, send_file, send_from_directory, session
 from PIL import Image, ImageOps
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
 from pic_selecter import grouper
 from pic_selecter.grouper import (
@@ -51,6 +57,10 @@ STATE_FILENAME = ".pic_selecter_state.json"
 STATE_SCHEMA = 6
 PIC_DIR = "_pic_selecter"
 THUMB_MAX = 1600
+DATA_ROOT = Path(os.environ.get("PIC_SELECTER_DATA_ROOT") or (Path.cwd() / "用户数据"))
+UPLOAD_ROOT = Path(os.environ.get("PIC_SELECTER_UPLOAD_ROOT") or (DATA_ROOT / "uploads"))
+DB_PATH = DATA_ROOT / "pianke.sqlite3"
+DOWNLOAD_TOKEN_MAX_AGE = 15 * 60
 
 # 可选：用于脚本/curl 访问的 token（默认不开启）
 # 设置 PIC_SELECTER_TOKEN 环境变量即启用
@@ -93,6 +103,7 @@ class GroupState:
 class SessionState:
     folder: str
     dry_run: bool
+    user_id: Optional[int] = None
     mode: str = "copy"                              # copy | move
     engine: str = "fast"                            # fast | expert（极速 vs 专家）
     groups: list[GroupState] = field(default_factory=list)
@@ -131,6 +142,7 @@ class JobState:
     """异步分组任务的进度。"""
     folder: str
     dry_run: bool
+    user_id: Optional[int] = None
     mode: str = "copy"
     engine: str = "fast"
     status: str = "pending"  # pending | scanning | hashing | grouping | done | error | cancelled
@@ -426,6 +438,7 @@ def save_state(state: SessionState) -> None:
         "schema": STATE_SCHEMA,
         "folder": state.folder,
         "dry_run": state.dry_run,
+        "user_id": state.user_id,
         "mode": state.mode,
         "engine": state.engine,
         "current_group": state.current_group,
@@ -491,6 +504,7 @@ def load_state(folder: str) -> Optional[SessionState]:
         sess = SessionState(
             folder=data["folder"],
             dry_run=data.get("dry_run", False),
+            user_id=data.get("user_id"),
             mode=data.get("mode", "copy"),
             engine=data.get("engine", "expert"),
             groups=groups,
@@ -743,11 +757,13 @@ def build_prescreen_session_from_infos(
     prescreen_enabled: bool,
     prescreen_strength: str,
     engine: str = "fast",
+    user_id: Optional[int] = None,
 ) -> SessionState:
     rejected, reasons = _prescreen_rejections(infos) if prescreen_enabled else ([], {})
     state = SessionState(
         folder=folder,
         dry_run=dry_run,
+        user_id=user_id,
         mode=mode,
         engine=engine,
         groups=[],
@@ -1007,7 +1023,8 @@ def build_session_from_groups(folder: str, dry_run: bool, mode: str,
                               near_seconds: int,
                               prescreen_enabled: bool = True,
                               prescreen_strength: str = "standard",
-                              engine: str = "fast") -> SessionState:
+                              engine: str = "fast",
+                              user_id: Optional[int] = None) -> SessionState:
     # 全局主角识别（pre-pass：所有照片做一次脸簇）—— expert 模式才有 face embedding
     main_subjects = (
         _identify_main_subjects(infos)
@@ -1029,7 +1046,7 @@ def build_session_from_groups(folder: str, dry_run: bool, mode: str,
         if getattr(i, "companions", None)
     }
     state = SessionState(
-        folder=folder, dry_run=dry_run, mode=mode, engine=engine, groups=groups,
+        folder=folder, dry_run=dry_run, user_id=user_id, mode=mode, engine=engine, groups=groups,
         threshold_near=threshold_near, threshold_far=threshold_far,
         near_seconds=near_seconds, prescreen_enabled=prescreen_enabled,
         prescreen_strength=prescreen_strength, prescreen_reviewed=False, meta=meta,
@@ -1470,9 +1487,15 @@ def _thumb_cache_key(rel: str, mtime: float, size: int, max_side: int) -> str:
 # ---------------- Flask ----------------
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.secret_key = os.environ.get("PIC_SELECTER_SECRET_KEY") or hashlib.sha256(
+    f"{Path.cwd()}|pianke-local-secret".encode("utf-8")
+).hexdigest()
 SESSION: Optional[SessionState] = None
 JOB: Optional[JobState] = None
 LOCK = threading.Lock()
+DOWNLOAD_LOCK = threading.Lock()
+USER_SESSIONS: dict[int, SessionState] = {}
+USER_JOBS: dict[int, JobState] = {}
 # Phase 4 预览阶段保留的 infos（任务完成后可重新分组而不重哈希）
 LAST_INFOS: Optional[list[ImageInfo]] = None
 
@@ -1485,6 +1508,166 @@ _GROUPING: dict = {
     "multi": 0,
     "error": None,
 }
+
+
+def _ensure_data_dirs() -> None:
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _db() -> sqlite3.Connection:
+    _ensure_data_dirs()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_auth_db() -> None:
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS upload_folders (
+                folder TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS download_tokens (
+                token_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                folder TEXT NOT NULL,
+                zip_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+
+
+def _username_ok(username: str) -> bool:
+    if not (3 <= len(username) <= 32):
+        return False
+    return all(ch.isalnum() or ch in "_-" for ch in username)
+
+
+def _current_user() -> Optional[sqlite3.Row]:
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    with _db() as conn:
+        return conn.execute(
+            "SELECT id, username, created_at FROM users WHERE id = ?",
+            (int(uid),),
+        ).fetchone()
+
+
+def _login_user(user_id: int) -> None:
+    session.clear()
+    session["user_id"] = int(user_id)
+
+
+def _require_user() -> Optional[Response]:
+    user = _current_user()
+    if user is None:
+        return jsonify({"error": "请先登录"}), 401
+    g.user = user
+    return None
+
+
+def _user_slug(user_id: int, username: str) -> str:
+    safe = secure_filename(username) or f"user-{user_id}"
+    return f"u{user_id}-{safe}"
+
+
+def _user_root(user: sqlite3.Row) -> Path:
+    return (DATA_ROOT / "users" / _user_slug(user["id"], user["username"])).resolve()
+
+
+def _user_upload_root(user: sqlite3.Row) -> Path:
+    return _user_root(user) / "uploads"
+
+
+def _user_download_root(user: sqlite3.Row) -> Path:
+    return _user_root(user) / "downloads"
+
+
+def _register_upload_folder(folder: Path, user_id: int) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO upload_folders(folder, user_id, created_at) VALUES (?, ?, ?)",
+            (str(folder.resolve()), int(user_id), int(time.time())),
+        )
+
+
+def _folder_owner_id(folder: str) -> Optional[int]:
+    resolved = str(Path(folder).resolve())
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM upload_folders WHERE folder = ?",
+            (resolved,),
+        ).fetchone()
+        if row:
+            return int(row["user_id"])
+    return None
+
+
+def _path_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _user_owns_folder(folder: str, user: sqlite3.Row) -> bool:
+    owner_id = _folder_owner_id(folder)
+    if owner_id is not None:
+        return owner_id == int(user["id"])
+    return _path_under(Path(folder), _user_root(user))
+
+
+def _session_belongs_to_user() -> bool:
+    if SESSION is None:
+        return True
+    user = getattr(g, "user", None)
+    if user is None:
+        return False
+    return SESSION.user_id in (None, int(user["id"])) and _user_owns_folder(SESSION.folder, user)
+
+
+def _activate_user_context() -> None:
+    global SESSION, JOB
+    user = getattr(g, "user", None)
+    if user is None:
+        return
+    uid = int(user["id"])
+    with LOCK:
+        SESSION = USER_SESSIONS.get(uid)
+        JOB = USER_JOBS.get(uid)
+
+
+def _store_user_session(sess: SessionState) -> None:
+    if sess.user_id is not None:
+        USER_SESSIONS[int(sess.user_id)] = sess
+
+
+def _store_user_job(job: JobState) -> None:
+    if job.user_id is not None:
+        USER_JOBS[int(job.user_id)] = job
+
+
+def _download_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.secret_key, salt="pianke-download-v1")
 
 
 @app.after_request
@@ -1544,6 +1727,27 @@ def _security_check():
     if request.method == "GET":
         return None
     return jsonify({"error": "POST 需要浏览器 Origin 或 X-Token"}), 403
+
+
+@app.before_request
+def _auth_check():
+    public = {
+        "/",
+        "/api/auth/register",
+        "/api/auth/login",
+        "/api/auth/me",
+    }
+    if request.path in public or request.path.startswith("/static/"):
+        return None
+    auth_resp = _require_user()
+    if auth_resp is not None:
+        return auth_resp
+    _activate_user_context()
+    if request.path.startswith("/api/download/"):
+        return None
+    if SESSION is not None and request.path.startswith("/api/") and not _session_belongs_to_user():
+        return jsonify({"error": "当前会话不属于此账号"}), 403
+    return None
 
 
 def _serialize_image_meta(path: Optional[str]) -> Optional[dict]:
@@ -1937,7 +2141,8 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
              threshold_near: int, threshold_far: int, near_seconds: int,
              prescreen_enabled: bool, prescreen_strength: str,
              face_aware: bool = True, engine: str = "fast",
-             llm_model: Optional[str] = None) -> None:
+             llm_model: Optional[str] = None,
+             user_id: Optional[int] = None) -> None:
     global SESSION, LAST_INFOS
     job = JOB
     assert job is not None
@@ -2007,11 +2212,13 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
                 folder, dry_run, mode, infos,
                 threshold_near, threshold_far, near_seconds,
                 prescreen_enabled, prescreen_strength, engine=engine,
+                user_id=user_id,
             )
             if _cancel_check() or job.status == "cancelled":
                 raise CancelledError()
             with LOCK:
                 SESSION = sess
+                _store_user_session(sess)
                 LAST_INFOS = infos
             job.status = "done"
             if rejected:
@@ -2046,6 +2253,7 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             prescreen_enabled=False,
             prescreen_strength=prescreen_strength,
             engine=engine,
+            user_id=user_id,
         )
         sess.prescreen_enabled = prescreen_enabled
         sess.prescreen_strength = prescreen_strength
@@ -2055,6 +2263,7 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
             raise CancelledError()
         with LOCK:
             SESSION = sess
+            _store_user_session(sess)
             LAST_INFOS = infos
         job.status = "done"
         if skipped:
@@ -2095,6 +2304,62 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def api_auth_register():
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not _username_ok(username):
+        return jsonify({"error": "账号需为 3-32 位字母/数字/下划线/短横线"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "密码至少 8 位"}), 400
+    now = int(time.time())
+    try:
+        with _db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
+                (username, generate_password_hash(password), now),
+            )
+            user_id = int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "账号已存在"}), 409
+    _login_user(user_id)
+    return jsonify({"ok": True, "user": {"id": user_id, "username": username}})
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    data = request.get_json(force=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if row is None or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "账号或密码错误"}), 401
+    _login_user(int(row["id"]))
+    return jsonify({"ok": True, "user": {"id": row["id"], "username": row["username"]}})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/me")
+def api_auth_me():
+    user = _current_user()
+    if user is None:
+        return jsonify({"authenticated": False})
+    return jsonify({
+        "authenticated": True,
+        "user": {"id": user["id"], "username": user["username"]},
+    })
 
 
 @app.route("/api/ark_key", methods=["GET"])
@@ -2238,6 +2503,7 @@ def api_llm_concurrency():
 @app.route("/api/start", methods=["POST"])
 def api_start():
     global JOB, SESSION
+    user = g.user
     data = request.get_json(force=True)
     folder = (data.get("folder") or "").strip()
     dry_run = bool(data.get("dry_run", False))
@@ -2267,6 +2533,8 @@ def api_start():
     folder = str(Path(folder).expanduser().resolve())
     if not Path(folder).is_dir():
         return jsonify({"error": f"目录不存在: {folder}"}), 400
+    if not _user_owns_folder(folder, user):
+        return jsonify({"error": "该照片目录不属于当前账号，请先用本账号上传"}), 403
     if engine == "tycoon" and not llm_model:
         return jsonify({"error": "土豪模式需要选择 LLM 模型"}), 400
 
@@ -2277,7 +2545,7 @@ def api_start():
         # 一次性运行：始终全新开始，不读旧 state，不复用缓存。
         # 旧的 state.json / winners / losers 由 _run_job 里的 _wipe_caches 清掉。
         JOB = JobState(
-            folder=folder, dry_run=dry_run, mode=mode, engine=engine,
+            folder=folder, dry_run=dry_run, user_id=int(user["id"]), mode=mode, engine=engine,
             status="pending",
             threshold_near=threshold_near, threshold_far=threshold_far,
             near_seconds=near_seconds, prescreen_enabled=prescreen_enabled,
@@ -2285,14 +2553,16 @@ def api_start():
             face_aware=face_aware,
             llm_model=llm_model,
         )
+        _store_user_job(JOB)
         SESSION = None
+        USER_SESSIONS.pop(int(user["id"]), None)
 
     t = threading.Thread(
         target=_run_job,
         args=(folder, dry_run, mode, wipe_cache,
               threshold_near, threshold_far, near_seconds,
               prescreen_enabled, prescreen_strength, face_aware, engine,
-              llm_model),
+              llm_model, int(user["id"])),
         daemon=True,
     )
     t.start()
@@ -2315,6 +2585,7 @@ def api_reset_session():
     # 2. 清 SESSION & LAST_INFOS
     with LOCK:
         SESSION = None
+        USER_SESSIONS.pop(int(g.user["id"]), None)
         LAST_INFOS = None
     return jsonify({"ok": True})
 
@@ -2722,10 +2993,11 @@ def _placeholder_response() -> Response:
 
 
 def _validate_path_under_folder(raw: str) -> Optional[Path]:
-    if SESSION is None:
+    base_folder = SESSION.folder if SESSION is not None else (JOB.folder if JOB is not None else None)
+    if not base_folder:
         return None
     p = Path(raw).resolve()
-    base = Path(SESSION.folder).resolve()
+    base = Path(base_folder).resolve()
     try:
         p.relative_to(base)
     except ValueError:
@@ -2737,7 +3009,7 @@ def _validate_path_under_folder(raw: str) -> Optional[Path]:
 
 @app.route("/api/image")
 def api_image():
-    """每次都现解、不写盘缓存。SESSION 不存在时也允许（着陆页样图 / 处理页流缩略图）。"""
+    """每次都现解、不写盘缓存。仅允许读取当前用户会话/任务目录内图片。"""
     raw = request.args.get("path", "")
     if not raw:
         return _placeholder_response()
@@ -2748,13 +3020,13 @@ def api_image():
     max_side = max(64, min(max_side, THUMB_MAX))
 
     p = Path(raw).resolve()
-    # 有 session 时校验路径必须在 folder 内（防止 session 期间被钓鱼路径打到任意文件）；
-    # 没 session 时只要文件存在即可（着陆页 peek 样图 / 处理页流缩略图）
-    if SESSION is not None:
-        try:
-            p.relative_to(Path(SESSION.folder).resolve())
-        except ValueError:
-            return _placeholder_response()
+    base_folder = SESSION.folder if SESSION is not None else (JOB.folder if JOB is not None else None)
+    if not base_folder:
+        return _placeholder_response()
+    try:
+        p.relative_to(Path(base_folder).resolve())
+    except ValueError:
+        return _placeholder_response()
     if not p.exists() or not p.is_file():
         return _placeholder_response()
 
@@ -3087,6 +3359,7 @@ def _run_grouping_async(accepted_infos, old_session_snapshot):
                 prescreen_enabled=False,
                 prescreen_strength=snap["prescreen_strength"],
                 engine=snap["engine"],
+                user_id=snap.get("user_id"),
             )
             new_session.prescreen_enabled = snap["prescreen_enabled"]
             new_session.prescreen_strength = snap["prescreen_strength"]
@@ -3111,6 +3384,7 @@ def _run_grouping_async(accepted_infos, old_session_snapshot):
             apply_pending_groups(new_session)
             save_state(new_session)
             SESSION = new_session
+            _store_user_session(new_session)
 
         multi_groups = [g for g in new_session.groups if len(g.images) > 1]
         multi_groups.sort(key=lambda g: _group_earliest_dt(g) or "9999")
@@ -3180,6 +3454,7 @@ def api_confirm_prescreen():
             "prescreen_reject_reasons": dict(SESSION.prescreen_reject_reasons),
             "prescreen_restored": list(SESSION.prescreen_restored),
             "meta": dict(SESSION.meta),
+            "user_id": SESSION.user_id,
         }
 
     t = threading.Thread(
@@ -3256,6 +3531,7 @@ def api_regroup():
         prescreen_enabled=False,
         prescreen_strength=SESSION.prescreen_strength,
         engine=SESSION.engine,
+        user_id=SESSION.user_id,
     )
     new_session.prescreen_enabled = SESSION.prescreen_enabled
     new_session.prescreen_strength = SESSION.prescreen_strength
@@ -3265,6 +3541,7 @@ def api_regroup():
     new_session.prescreen_restored = list(SESSION.prescreen_restored)
     with LOCK:
         SESSION = new_session
+        _store_user_session(new_session)
     return jsonify({
         "ok": True,
         "total_groups": len(SESSION.groups),
@@ -3331,6 +3608,15 @@ def api_capabilities():
 @app.route("/api/browse_folder", methods=["POST"])
 def api_browse_folder():
     """调起系统原生选文件夹对话框（macOS: osascript / Win: tkinter / Linux: zenity）。"""
+    def _is_user_cancelled(text: str) -> bool:
+        text = text or ""
+        return (
+            "User canceled" in text
+            or "User cancelled" in text
+            or "用户已取消" in text
+            or "(-128)" in text
+        )
+
     try:
         if sys.platform == "darwin":
             script = (
@@ -3344,7 +3630,7 @@ def api_browse_folder():
             )
             if proc.returncode != 0:
                 # 用户取消时 osascript 返回非 0 + stderr 含 "User canceled"
-                if "User canceled" in (proc.stderr or "") or "User cancelled" in (proc.stderr or ""):
+                if _is_user_cancelled(proc.stderr or ""):
                     return jsonify({"ok": True, "cancelled": True})
                 return jsonify({"error": (proc.stderr or "选择失败").strip()}), 500
             chosen = (proc.stdout or "").strip().rstrip("/")
@@ -3383,6 +3669,50 @@ def api_browse_folder():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/upload_mobile_photos", methods=["POST"])
+def api_upload_mobile_photos():
+    """移动端导入：手机浏览器只能给文件内容，不能给可被后端读取的本机路径。"""
+    user = g.user
+    files = request.files.getlist("photos")
+    if not files:
+        return jsonify({"error": "没有选择照片"}), 400
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    token = uuid.uuid4().hex[:6]
+    target_dir = (_user_upload_root(user) / f"{stamp}-{token}").resolve()
+    target_dir.mkdir(parents=True, exist_ok=False)
+
+    saved: list[str] = []
+    skipped: list[str] = []
+    for idx, storage in enumerate(files, start=1):
+        original = storage.filename or f"photo-{idx}"
+        suffix = Path(original).suffix.lower()
+        if suffix not in grouper.ALL_INPUT_EXTS:
+            skipped.append(original)
+            continue
+        name = secure_filename(Path(original).name) or f"photo-{idx}{suffix}"
+        if not Path(name).suffix:
+            name += suffix
+        dst = _unique_target(target_dir, name)
+        storage.save(dst)
+        saved.append(str(dst))
+
+    if not saved:
+        try:
+            target_dir.rmdir()
+        except OSError:
+            pass
+        return jsonify({"error": "没有可处理的图片格式"}), 400
+    _register_upload_folder(target_dir, int(user["id"]))
+
+    return jsonify({
+        "ok": True,
+        "folder": str(target_dir),
+        "count": len(saved),
+        "skipped": skipped,
+    })
+
+
 @app.route("/api/peek_folder", methods=["POST"])
 def api_peek_folder():
     """轻量扫描：仅统计文件数 / 体积 / 时间跨度，不读图像内容。
@@ -3398,6 +3728,8 @@ def api_peek_folder():
         return jsonify({"ok": False, "error": "路径不存在"})
     if not p.is_dir():
         return jsonify({"ok": False, "error": "不是文件夹"})
+    if not _user_owns_folder(str(p.resolve()), g.user):
+        return jsonify({"ok": False, "error": "该目录不属于当前账号"})
 
     count = 0
     total_size = 0
@@ -3546,6 +3878,106 @@ def _winner_paths() -> list[str]:
             if Path(actual).exists():
                 paths.append(actual)
     return paths
+
+
+def _make_winners_zip(user: sqlite3.Row, winners: list[str]) -> tuple[str, Path, int]:
+    now = int(time.time())
+    token_id = uuid.uuid4().hex
+    out_dir = _user_download_root(user) / time.strftime("%Y%m%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = (out_dir / f"{now}-{token_id}.zip").resolve()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        used_names: set[str] = set()
+        for src in winners:
+            p = Path(src)
+            if not p.exists() or not p.is_file():
+                continue
+            name = secure_filename(p.name) or f"winner-{len(used_names) + 1}{p.suffix}"
+            base_name = name
+            i = 2
+            while name in used_names:
+                stem = Path(base_name).stem
+                suffix = Path(base_name).suffix
+                name = f"{stem}-{i}{suffix}"
+                i += 1
+            used_names.add(name)
+            zf.write(p, arcname=name)
+    expires_at = now + DOWNLOAD_TOKEN_MAX_AGE
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO download_tokens(token_id, user_id, folder, zip_path, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (token_id, int(user["id"]), SESSION.folder if SESSION else "", str(zip_path), now, expires_at),
+        )
+    signed = _download_serializer().dumps({
+        "tid": token_id,
+        "uid": int(user["id"]),
+        "sig": hmac.new(app.secret_key.encode("utf-8"), token_id.encode("utf-8"), hashlib.sha256).hexdigest()[:16],
+    })
+    return signed, zip_path, expires_at
+
+
+@app.route("/api/download_winners", methods=["POST"])
+def api_download_winners():
+    if SESSION is None:
+        return jsonify({"error": "no session"}), 400
+    if not _session_belongs_to_user():
+        return jsonify({"error": "当前会话不属于此账号"}), 403
+    winners = _winner_paths()
+    if not winners:
+        return jsonify({"error": "没有可下载的胜出图片"}), 400
+    token, zip_path, expires_at = _make_winners_zip(g.user, winners)
+    return jsonify({
+        "ok": True,
+        "count": len(winners),
+        "download_url": f"/api/download/{token}",
+        "expires_at": expires_at,
+        "size": zip_path.stat().st_size,
+    })
+
+
+@app.route("/api/download/<token>")
+def api_download(token: str):
+    auth_resp = _require_user()
+    if auth_resp is not None:
+        return auth_resp
+    try:
+        payload = _download_serializer().loads(token, max_age=DOWNLOAD_TOKEN_MAX_AGE)
+    except SignatureExpired:
+        return jsonify({"error": "下载链接已过期"}), 410
+    except BadSignature:
+        return jsonify({"error": "下载链接无效"}), 403
+    token_id = payload.get("tid")
+    uid = int(payload.get("uid") or 0)
+    expected_sig = hmac.new(app.secret_key.encode("utf-8"), str(token_id).encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    if uid != int(g.user["id"]) or not hmac.compare_digest(payload.get("sig", ""), expected_sig):
+        return jsonify({"error": "下载链接无效"}), 403
+    with DOWNLOAD_LOCK, _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM download_tokens WHERE token_id = ?",
+            (token_id,),
+        ).fetchone()
+        if row is None or int(row["user_id"]) != int(g.user["id"]):
+            return jsonify({"error": "下载链接不存在"}), 404
+        now = int(time.time())
+        if int(row["expires_at"]) < now:
+            return jsonify({"error": "下载链接已过期"}), 410
+        zip_path = Path(row["zip_path"]).resolve()
+        if not _path_under(zip_path, _user_download_root(g.user)) or not zip_path.exists():
+            return jsonify({"error": "下载文件不存在"}), 404
+        conn.execute(
+            "UPDATE download_tokens SET used_at = COALESCE(used_at, ?) WHERE token_id = ?",
+            (now, token_id),
+        )
+    return send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"pianke-winners-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+        max_age=0,
+    )
 
 
 @app.route("/api/watermark/templates")
@@ -3732,6 +4164,7 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
+    _init_auth_db()
     setup_logger(None)
     url = f"http://localhost:{args.port}"
     print(f"\n启动于 {url}")

@@ -15,6 +15,8 @@ let currentGroup = null;
 let currentMode = "move";
 let recentWinners = []; // 最近胜出路径，给 arena-stack 用
 let streamSeq = 0;       // streaming log 已渲染到的 event_seq
+let currentUser = null;
+let authMode = "login";
 
 // ---- 处理页照片墙 ----
 let wallCells = [];          // [{el, ev, addedAt}]
@@ -96,9 +98,21 @@ function originalUrl(path) {
   return `/api/image_original?path=${encodeURIComponent(path)}`;
 }
 
+function isMobileLike() {
+  const ua = navigator.userAgent || "";
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || window.matchMedia("(max-width: 720px)").matches;
+}
+
+function updateBrowseMode() {
+  const btn = $("browse-btn");
+  if (!btn) return;
+  btn.lastChild.textContent = isMobileLike() ? "选择照片" : "选择文件夹";
+  btn.title = isMobileLike() ? "从手机选择照片并导入到电脑服务" : "打开系统选择对话框";
+}
+
 async function fetchJSON(url, opts = {}) {
   opts.headers = { ...(opts.headers || {}) };
-  if (opts.body && !opts.headers["Content-Type"]) {
+  if (opts.body && !(opts.body instanceof FormData) && !opts.headers["Content-Type"]) {
     opts.headers["Content-Type"] = "application/json";
   }
   const resp = await fetch(url, opts);
@@ -110,6 +124,55 @@ async function fetchJSON(url, opts = {}) {
     throw new Error(msg);
   }
   return data;
+}
+
+function setAuthed(user) {
+  currentUser = user || null;
+  document.body.classList.toggle("is-authed", !!currentUser);
+  $("auth-form").hidden = !!currentUser;
+  $("start-form").classList.toggle("auth-locked", !currentUser);
+  $("auth-status").hidden = !currentUser;
+  if (currentUser) $("auth-user").textContent = currentUser.username;
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  document.querySelectorAll(".auth-tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.authMode === mode);
+  });
+  $("auth-submit").textContent = mode === "register" ? "注册并登录" : "登录";
+  $("auth-password").autocomplete = mode === "register" ? "new-password" : "current-password";
+  $("auth-error").textContent = "";
+}
+
+async function refreshAuth() {
+  try {
+    const r = await fetchJSON("/api/auth/me");
+    setAuthed(r.authenticated ? r.user : null);
+  } catch {
+    setAuthed(null);
+  }
+}
+
+async function submitAuth(e) {
+  e.preventDefault();
+  const username = $("auth-username").value.trim();
+  const password = $("auth-password").value;
+  $("auth-error").textContent = "";
+  $("auth-submit").disabled = true;
+  try {
+    const r = await fetchJSON(`/api/auth/${authMode}`, {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    setAuthed(r.user);
+    $("auth-password").value = "";
+    setStatus("引擎就绪", "idle");
+  } catch (e) {
+    $("auth-error").textContent = e.message;
+  } finally {
+    $("auth-submit").disabled = false;
+  }
 }
 
 function fmtElapsed(s) {
@@ -210,6 +273,19 @@ async function goHome() {
 }
 
 document.querySelectorAll(".btn-go-home").forEach(el => el.addEventListener("click", goHome));
+document.querySelectorAll(".auth-tab").forEach((tab) => {
+  tab.addEventListener("click", () => setAuthMode(tab.dataset.authMode || "login"));
+});
+$("auth-form").addEventListener("submit", submitAuth);
+$("auth-logout").addEventListener("click", async () => {
+  try {
+    await fetchJSON("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
+  } catch {}
+  setAuthed(null);
+  showView("landing");
+  setStatus("请登录", "idle");
+});
+setAuthMode("login");
 
 // =================================================================
 // 着陆页
@@ -592,6 +668,11 @@ dropZone.addEventListener("drop", (e) => {
 
 async function handleStart(e) {
   if (e && e.preventDefault) e.preventDefault();
+  if (!currentUser) {
+    $("auth-username").focus();
+    setStatus("请先登录", "error");
+    return;
+  }
   const folder = $("folder-input").value.trim();
   const dry_run = false;  // 试运行入口已下线；后端仍兼容此参数
   // 一次性运行：每次 start 后端都会清掉 winners/losers/state，不再需要这个选项
@@ -660,7 +741,47 @@ async function handleStart(e) {
 $("start-btn").addEventListener("click", handleStart);
 $("start-form").addEventListener("submit", handleStart);
 
+async function uploadMobilePhotos(files) {
+  if (!files || !files.length) return;
+  if (!currentUser) {
+    $("auth-username").focus();
+    toast("请先登录后再上传照片");
+    return;
+  }
+  const btn = $("browse-btn");
+  const startBtn = $("start-btn");
+  const form = new FormData();
+  for (const file of files) form.append("photos", file);
+  btn.disabled = true;
+  startBtn.disabled = true;
+  setStatus(`正在导入 ${files.length} 张照片…`, "busy");
+  try {
+    const r = await fetchJSON("/api/upload_mobile_photos", { method: "POST", body: form });
+    $("folder-input").value = r.folder;
+    $("start-error").textContent = "";
+    requestFolderPeek(r.folder);
+    const skipped = r.skipped?.length ? `，跳过 ${r.skipped.length} 个不支持文件` : "";
+    toast(`已导入 ${r.count} 张照片${skipped}`, 3600);
+  } catch (e) {
+    toast("导入失败：" + e.message, 4200);
+    setStatus("导入失败", "error");
+  } finally {
+    btn.disabled = false;
+    startBtn.disabled = false;
+    $("mobile-photo-input").value = "";
+  }
+}
+
 $("browse-btn").addEventListener("click", async () => {
+  if (!currentUser) {
+    $("auth-username").focus();
+    toast("请先登录");
+    return;
+  }
+  if (isMobileLike()) {
+    $("mobile-photo-input").click();
+    return;
+  }
   const btn = $("browse-btn");
   btn.disabled = true;
   try {
@@ -677,6 +798,11 @@ $("browse-btn").addEventListener("click", async () => {
     btn.disabled = false;
   }
 });
+$("mobile-photo-input").addEventListener("change", (e) => {
+  uploadMobilePhotos(e.target.files);
+});
+updateBrowseMode();
+window.addEventListener("resize", updateBrowseMode);
 $("folder-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); handleStart(e); }
 });
@@ -2432,6 +2558,23 @@ $("btn-open-folder").addEventListener("click", async () => {
   catch (e) { toast("打开失败：" + e.message); }
 });
 
+$("btn-download-winners").addEventListener("click", async () => {
+  const btn = $("btn-download-winners");
+  btn.disabled = true;
+  try {
+    const r = await fetchJSON("/api/download_winners", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    window.location.href = r.download_url;
+    toast(`已生成下载包（${r.count} 张）`, 3600);
+  } catch (e) {
+    toast("下载失败：" + e.message, 4200);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 $("btn-redo-folder").addEventListener("click", async () => {
   const s = lastSession || (await fetchJSON("/api/status").catch(() => null));
   if (!s || !s.folder) { toast("没有可重做的会话"); return; }
@@ -2526,6 +2669,13 @@ $("lb-original").addEventListener("click", () => {
 async function bootstrap() {
   renderRecent();
   setStatus("引擎就绪", "idle");
+  await refreshAuth();
+  if (!currentUser) {
+    showView("landing", false);
+    history.replaceState({ view: "landing" }, "", location.pathname);
+    setStatus("请登录", "idle");
+    return;
+  }
   try {
     const s = await fetchJSON("/api/status");
     if (s.ready) {

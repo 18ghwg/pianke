@@ -24,13 +24,29 @@
         <span class="brand-mark"></span>
         <span class="brand-name">片刻</span>
       </div>
-      <span class="site-tag">本地运行 · 不上传</span>
+      <div class="auth-status" id="auth-status" hidden>
+        <span id="auth-user"></span>
+        <button type="button" id="auth-logout" class="btn-ghost btn-small">退出</button>
+      </div>
     </header>
 
     <main class="landing-main">
       <p class="eyebrow">在一摞照片里，留下那一刻</p>
       <h1 class="hero-title">让 AI 替你过一遍，<br>由你做最后的<em>决定</em>。</h1>
       <p class="hero-sub">先按相似度自动成组、淘汰明显失败片，<br>剩下的两两摆上擂台，由你裁决。</p>
+
+      <form id="auth-form" class="auth-panel" autocomplete="off">
+        <div class="auth-tabs" role="tablist" aria-label="账号操作">
+          <button type="button" class="auth-tab active" data-auth-mode="login">登录</button>
+          <button type="button" class="auth-tab" data-auth-mode="register">注册</button>
+        </div>
+        <div class="auth-fields">
+          <input id="auth-username" type="text" placeholder="账号" autocomplete="username" spellcheck="false">
+          <input id="auth-password" type="password" placeholder="密码（至少 8 位）" autocomplete="current-password">
+          <button type="submit" id="auth-submit" class="btn btn-primary">登录</button>
+        </div>
+        <p id="auth-error" class="form-error"></p>
+      </form>
 
       <form id="start-form" class="start-form" autocomplete="off" action="javascript:void(0)" onsubmit="return false">
         <div class="engine-switch" role="radiogroup" aria-label="算法模式">
@@ -89,6 +105,13 @@
             选择文件夹
           </button>
           <input
+            type="file"
+            id="mobile-photo-input"
+            class="visually-hidden"
+            accept="image/*,.heic,.heif,.dng,.arw,.cr2,.cr3,.nef,.nrw,.orf,.raf,.rw2,.pef,.srw,.x3f,.raw"
+            multiple
+          >
+          <input
             type="text"
             id="folder-input"
             name="folder"
@@ -104,6 +127,9 @@
             </svg>
           </button>
         </div>
+        <p class="field-help" id="folder-help">
+          手机端会先把选中的照片导入到运行服务的电脑，再开始处理；桌面端可直接选择电脑上的照片文件夹。
+        </p>
 
         <!-- 路径选好后浮出的"文件夹快照"：纯文件系统数据，0 推理 -->
         <div id="folder-snapshot" class="folder-snapshot hidden">
@@ -591,6 +617,7 @@
     </div>
     <div class="done-h-right">
       <button id="btn-open-folder" class="btn-ghost">打开文件夹</button>
+      <button id="btn-download-winners" class="btn-ghost" title="打包下载胜出的照片">下载胜出</button>
       <button id="btn-watermark" class="btn-ghost" title="给胜出照片批量加相机品牌水印">相机水印</button>
       <button id="btn-redo-folder" class="btn-ghost" title="清掉本次结果，重新挑这个文件夹">重做本次</button>
       <button class="btn-ghost btn-go-home" title="回到主页">
